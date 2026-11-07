@@ -154,7 +154,10 @@ def train():
         qwen3tts.model.parameters(),
         lr=args.lr,
         weight_decay=0.01,
+        foreach=False,
+        
     )
+    
 
     # ---------------------------------------------------------
     # 6. Prepare model, optimizer and dataloader
