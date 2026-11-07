@@ -108,7 +108,7 @@ def train():
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         attn_implementation="sdpa",
     )
 
