@@ -1,18 +1,8 @@
+
 # coding=utf-8
-# Copyright 2026 The Alibaba Qwen team.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Qwen3-TTS 12Hz SFT fine-tuning
+# T4-compatible version for Qwen3-TTS-12Hz-0.6B-Base
+
 import argparse
 import json
 import os
@@ -21,141 +11,520 @@ import shutil
 import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
+from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
+
 target_speaker_embedding = None
+
+
 def train():
     global target_speaker_embedding
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-    parser.add_argument("--output_model_path", type=str, default="output")
-    parser.add_argument("--train_jsonl", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+
+    parser.add_argument(
+        "--init_model_path",
+        type=str,
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    )
+    parser.add_argument(
+        "--output_model_path",
+        type=str,
+        default="output",
+    )
+    parser.add_argument(
+        "--train_jsonl",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=2e-5,
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--speaker_name",
+        type=str,
+        default="my_speaker",
+    )
+
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    # ---------------------------------------------------------
+    # 1. Accelerator configuration
+    # ---------------------------------------------------------
 
-    MODEL_PATH = args.init_model_path
+    accelerator = Accelerator(
+        gradient_accumulation_steps=4,
+        mixed_precision="fp16",
+        log_with="tensorboard",
+        project_dir="/kaggle/working/logs",
+    )
+
+    if accelerator.is_main_process:
+        print("Starting Qwen3-TTS fine-tuning")
+        print(f"Model: {args.init_model_path}")
+        print(f"Dataset: {args.train_jsonl}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Learning rate: {args.lr}")
+        print(f"Epochs: {args.num_epochs}")
+        print(f"Speaker: {args.speaker_name}")
+
+    # ---------------------------------------------------------
+    # 2. Resolve model path
+    #
+    # snapshot_download returns a real local directory.
+    # This is important because checkpoint saving uses copytree.
+    # ---------------------------------------------------------
+
+    MODEL_PATH = snapshot_download(
+        repo_id=args.init_model_path,
+    )
+
+    if accelerator.is_main_process:
+        print(f"Local model path: {MODEL_PATH}")
+
+    # ---------------------------------------------------------
+    # 3. Load model in FP16 and use SDPA
+    #
+    # T4 GPUs do not support native BF16.
+    # SDPA avoids the Flash Attention 2 dependency.
+    # ---------------------------------------------------------
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
     )
+
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    train_data = open(args.train_jsonl).readlines()
-    train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    # ---------------------------------------------------------
+    # 4. Load training dataset
+    # ---------------------------------------------------------
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    with open(args.train_jsonl, "r", encoding="utf-8") as f:
+        train_data = [
+            json.loads(line)
+            for line in f
+            if line.strip()
+        ]
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader
+    if not train_data:
+        raise ValueError("The training JSONL file is empty.")
+
+    if accelerator.is_main_process:
+        print(f"Training samples: {len(train_data)}")
+
+    dataset = TTSDataset(
+        train_data,
+        qwen3tts.processor,
+        config,
     )
 
-    num_epochs = args.num_epochs
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=dataset.collate_fn,
+        pin_memory=True,
+        num_workers=0,
+    )
+
+    # ---------------------------------------------------------
+    # 5. Optimizer
+    # ---------------------------------------------------------
+
+    optimizer = AdamW(
+        qwen3tts.model.parameters(),
+        lr=args.lr,
+        weight_decay=0.01,
+    )
+
+    # ---------------------------------------------------------
+    # 6. Prepare model, optimizer and dataloader
+    # ---------------------------------------------------------
+
+    model, optimizer, train_dataloader = accelerator.prepare(
+        qwen3tts.model,
+        optimizer,
+        train_dataloader,
+    )
+
     model.train()
 
+    # ---------------------------------------------------------
+    # 7. TensorBoard tracking
+    # ---------------------------------------------------------
+
+    accelerator.init_trackers(
+        "qwen3-tts-saudi",
+        config={
+            "model": args.init_model_path,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "epochs": args.num_epochs,
+            "speaker": args.speaker_name,
+            "mixed_precision": "fp16",
+            "attention": "sdpa",
+        },
+    )
+
+    global_step = 0
+    num_epochs = args.num_epochs
+
+    # ---------------------------------------------------------
+    # 8. Training loop
+    # ---------------------------------------------------------
+
     for epoch in range(num_epochs):
+
+        model.train()
+
         for step, batch in enumerate(train_dataloader):
+
             with accelerator.accumulate(model):
 
-                input_ids = batch['input_ids']
-                codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
-                text_embedding_mask = batch['text_embedding_mask']
-                codec_embedding_mask = batch['codec_embedding_mask']
-                attention_mask = batch['attention_mask']
-                codec_0_labels = batch['codec_0_labels']
-                codec_mask = batch['codec_mask']
+                # ---------------------------------------------
+                # Move batch tensors to the model device
+                # ---------------------------------------------
 
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                input_ids = batch["input_ids"]
+                codec_ids = batch["codec_ids"]
+                ref_mels = batch["ref_mels"]
+
+                text_embedding_mask = batch["text_embedding_mask"]
+                codec_embedding_mask = batch["codec_embedding_mask"]
+
+                attention_mask = batch["attention_mask"]
+                codec_0_labels = batch["codec_0_labels"]
+                codec_mask = batch["codec_mask"]
+
+                # ---------------------------------------------
+                # Speaker embedding
+                # ---------------------------------------------
+
+                speaker_embedding = model.speaker_encoder(
+                    ref_mels.to(
+                        device=model.device,
+                        dtype=model.dtype,
+                    )
+                ).detach()
+
                 if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
+                    target_speaker_embedding = speaker_embedding.detach()
+
+                # ---------------------------------------------
+                # Separate text and codec IDs
+                # ---------------------------------------------
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                # ---------------------------------------------
+                # Text embedding projection
+                #
+                # For the 0.6B model:
+                # text embedding dimension = 2048
+                # talker hidden dimension = 1024
+                #
+                # The projection belongs to model.talker,
+                # not model.talker.model.
+                # Apply the mask AFTER projection because
+                # the projection layer has a bias.
+                # ---------------------------------------------
+
+                input_text_embedding = model.talker.text_projection(
+                    model.talker.model.text_embedding(input_text_ids)
+                )
+
+                input_text_embedding = (
+                    input_text_embedding * text_embedding_mask
+                )
+
+                # ---------------------------------------------
+                # Codec embedding
+                # ---------------------------------------------
+
+                input_codec_embedding = (
+                    model.talker.model.codec_embedding(input_codec_ids)
+                    * codec_embedding_mask
+                )
+
+                # Insert speaker embedding
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
-                input_embeddings = input_text_embedding + input_codec_embedding
+                # ---------------------------------------------
+                # Combine text and codec embeddings
+                # ---------------------------------------------
+
+                input_embeddings = (
+                    input_text_embedding + input_codec_embedding
+                )
+
+                # ---------------------------------------------
+                # Add sub-codec embeddings
+                # ---------------------------------------------
 
                 for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
+
+                    codec_i_embedding = (
+                        model.talker.code_predictor
+                        .get_input_embeddings()[i - 1](
+                            codec_ids[:, :, i]
+                        )
+                    )
+
+                    codec_i_embedding = (
+                        codec_i_embedding * codec_mask.unsqueeze(-1)
+                    )
+
+                    input_embeddings = (
+                        input_embeddings + codec_i_embedding
+                    )
+
+                # ---------------------------------------------
+                # Main talker forward pass
+                # ---------------------------------------------
 
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
+                    output_hidden_states=True,
                 )
 
+                # ---------------------------------------------
+                # Sub-talker loss
+                # ---------------------------------------------
+
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+
+                talker_hidden_states = hidden_states[
+                    codec_mask[:, :-1]
+                ]
+
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                sub_talker_logits, sub_talker_loss = (
+                    model.talker.forward_sub_talker_finetune(
+                        talker_codec_ids,
+                        talker_hidden_states,
+                    )
+                )
+
+                # ---------------------------------------------
+                # Combined loss
+                # ---------------------------------------------
 
                 loss = outputs.loss + 0.3 * sub_talker_loss
+
+                # ---------------------------------------------
+                # Backpropagation
+                # ---------------------------------------------
 
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    accelerator.clip_grad_norm_(
+                        model.parameters(),
+                        1.0,
+                    )
 
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if step % 10 == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+            # ---------------------------------------------
+            # Logging
+            # ---------------------------------------------
+
+            if global_step % 10 == 0:
+
+                current_loss = loss.detach().float().item()
+
+                accelerator.print(
+                    f"Epoch {epoch + 1}/{num_epochs} "
+                    f"| Step {global_step} "
+                    f"| Loss: {current_loss:.4f}"
+                )
+
+                accelerator.log(
+                    {
+                        "train/loss": current_loss,
+                        "train/main_loss": outputs.loss.detach().float().item(),
+                        "train/sub_talker_loss": sub_talker_loss.detach().float().item(),
+                    },
+                    step=global_step,
+                )
+
+            global_step += 1
+
+        # -----------------------------------------------------
+        # 9. Save checkpoint after each epoch
+        # -----------------------------------------------------
+
+        accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
-            output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
+            output_dir = os.path.join(
+                args.output_model_path,
+                f"checkpoint-epoch-{epoch}",
+            )
+
+            os.makedirs(args.output_model_path, exist_ok=True)
+
+            # Copy the original model files into the checkpoint.
+            shutil.copytree(
+                MODEL_PATH,
+                output_dir,
+                dirs_exist_ok=True,
+            )
+
+            # ---------------------------------------------
+            # Update model configuration
+            # ---------------------------------------------
+
+            input_config_file = os.path.join(
+                MODEL_PATH,
+                "config.json",
+            )
+
+            output_config_file = os.path.join(
+                output_dir,
+                "config.json",
+            )
+
+            with open(
+                input_config_file,
+                "r",
+                encoding="utf-8",
+            ) as f:
                 config_dict = json.load(f)
+
             config_dict["tts_model_type"] = "custom_voice"
-            talker_config = config_dict.get("talker_config", {})
+
+            talker_config = config_dict.get(
+                "talker_config",
+                {},
+            )
+
             talker_config["spk_id"] = {
                 args.speaker_name: 3000
             }
+
             talker_config["spk_is_dialect"] = {
                 args.speaker_name: False
             }
+
             config_dict["talker_config"] = talker_config
 
-            with open(output_config_file, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
+            with open(
+                output_config_file,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    config_dict,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            # ---------------------------------------------
+            # Save trained model weights
+            # ---------------------------------------------
 
             unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
+            state_dict = {
+                key: value.detach().to("cpu").contiguous()
+                for key, value in unwrapped_model.state_dict().items()
+            }
+
+            # Remove speaker encoder weights.
             drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
 
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-            save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
+            keys_to_drop = [
+                key
+                for key in state_dict
+                if key.startswith(drop_prefix)
+            ]
+
+            for key in keys_to_drop:
+                del state_dict[key]
+
+            # ---------------------------------------------
+            # Save target speaker embedding at speaker ID 3000
+            # ---------------------------------------------
+
+            codec_embedding_key = (
+                "talker.model.codec_embedding.weight"
+            )
+
+            if codec_embedding_key not in state_dict:
+                raise KeyError(
+                    f"Missing expected weight: {codec_embedding_key}"
+                )
+
+            if target_speaker_embedding is None:
+                raise RuntimeError(
+                    "Target speaker embedding was not initialized."
+                )
+
+            codec_embedding_weight = state_dict[
+                codec_embedding_key
+            ]
+
+            codec_embedding_weight[3000] = (
+                target_speaker_embedding[0]
+                .detach()
+                .to(device="cpu", dtype=codec_embedding_weight.dtype)
+            )
+
+            # ---------------------------------------------
+            # Write safetensors checkpoint
+            # ---------------------------------------------
+
+            save_path = os.path.join(
+                output_dir,
+                "model.safetensors",
+            )
+
+            save_file(
+                state_dict,
+                save_path,
+            )
+
+            accelerator.print(
+                f"Checkpoint saved successfully: {output_dir}"
+            )
+
+    # ---------------------------------------------------------
+    # 10. Finish tracking
+    # ---------------------------------------------------------
+
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
+
+    if accelerator.is_main_process:
+        print("Fine-tuning completed.")
+
 
 if __name__ == "__main__":
     train()
