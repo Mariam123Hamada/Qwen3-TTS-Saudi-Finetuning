@@ -1,7 +1,8 @@
 
 # coding=utf-8
 # Qwen3-TTS 12Hz SFT fine-tuning
-# T4-compatible version for Qwen3-TTS-12Hz-0.6B-Base
+# Memory-optimized version for Tesla T4 (16GB)
+# Model: Qwen3-TTS-12Hz-0.6B-Base
 
 import argparse
 import json
@@ -14,7 +15,7 @@ from dataset import TTSDataset
 from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
-from torch.optim import AdamW
+from bitsandbytes.optim import AdamW8bit
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
@@ -32,31 +33,37 @@ def train():
         type=str,
         default="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     )
+
     parser.add_argument(
         "--output_model_path",
         type=str,
         default="output",
     )
+
     parser.add_argument(
         "--train_jsonl",
         type=str,
         required=True,
     )
+
     parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
     )
+
     parser.add_argument(
         "--lr",
         type=float,
         default=2e-5,
     )
+
     parser.add_argument(
         "--num_epochs",
         type=int,
         default=1,
     )
+
     parser.add_argument(
         "--speaker_name",
         type=str,
@@ -87,9 +94,6 @@ def train():
 
     # ---------------------------------------------------------
     # 2. Resolve model path
-    #
-    # snapshot_download returns a real local directory.
-    # This is important because checkpoint saving uses copytree.
     # ---------------------------------------------------------
 
     MODEL_PATH = snapshot_download(
@@ -100,10 +104,12 @@ def train():
         print(f"Local model path: {MODEL_PATH}")
 
     # ---------------------------------------------------------
-    # 3. Load model in FP16 and use SDPA
+    # 3. Load model in FP32 and use SDPA
     #
-    # T4 GPUs do not support native BF16.
-    # SDPA avoids the Flash Attention 2 dependency.
+    # Keep FP32 model parameters to avoid the previous
+    # "Attempting to unscale FP16 gradients" error.
+    #
+    # FP16 mixed precision is handled by Accelerate.
     # ---------------------------------------------------------
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
@@ -147,17 +153,16 @@ def train():
     )
 
     # ---------------------------------------------------------
-    # 5. Optimizer
+    # 5. 8-bit Optimizer
+    #
+    # Uses less GPU memory than regular AdamW.
     # ---------------------------------------------------------
 
-    optimizer = AdamW(
+    optimizer = AdamW8bit(
         qwen3tts.model.parameters(),
         lr=args.lr,
         weight_decay=0.01,
-        foreach=False,
-        
     )
-    
 
     # ---------------------------------------------------------
     # 6. Prepare model, optimizer and dataloader
@@ -169,10 +174,30 @@ def train():
         train_dataloader,
     )
 
+    # ---------------------------------------------------------
+    # 7. Enable gradient checkpointing when supported
+    # ---------------------------------------------------------
+
+    unwrapped_model = accelerator.unwrap_model(model)
+
+    if hasattr(unwrapped_model.talker, "gradient_checkpointing_enable"):
+
+        unwrapped_model.talker.gradient_checkpointing_enable()
+
+        accelerator.print(
+            "Gradient checkpointing enabled for the talker."
+        )
+
+    else:
+
+        accelerator.print(
+            "Warning: Talker does not expose gradient checkpointing."
+        )
+
     model.train()
 
     # ---------------------------------------------------------
-    # 7. TensorBoard tracking
+    # 8. TensorBoard tracking
     # ---------------------------------------------------------
 
     accelerator.init_trackers(
@@ -185,6 +210,8 @@ def train():
             "speaker": args.speaker_name,
             "mixed_precision": "fp16",
             "attention": "sdpa",
+            "optimizer": "AdamW8bit",
+            "gradient_accumulation_steps": 4,
         },
     )
 
@@ -192,7 +219,7 @@ def train():
     num_epochs = args.num_epochs
 
     # ---------------------------------------------------------
-    # 8. Training loop
+    # 9. Training loop
     # ---------------------------------------------------------
 
     for epoch in range(num_epochs):
@@ -204,7 +231,7 @@ def train():
             with accelerator.accumulate(model):
 
                 # ---------------------------------------------
-                # Move batch tensors to the model device
+                # Move batch tensors to model device
                 # ---------------------------------------------
 
                 input_ids = batch["input_ids"]
@@ -230,7 +257,9 @@ def train():
                 ).detach()
 
                 if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding.detach()
+                    target_speaker_embedding = (
+                        speaker_embedding.detach()
+                    )
 
                 # ---------------------------------------------
                 # Separate text and codec IDs
@@ -241,15 +270,6 @@ def train():
 
                 # ---------------------------------------------
                 # Text embedding projection
-                #
-                # For the 0.6B model:
-                # text embedding dimension = 2048
-                # talker hidden dimension = 1024
-                #
-                # The projection belongs to model.talker,
-                # not model.talker.model.
-                # Apply the mask AFTER projection because
-                # the projection layer has a bias.
                 # ---------------------------------------------
 
                 input_text_embedding = model.talker.text_projection(
@@ -350,7 +370,8 @@ def train():
                     )
 
                 optimizer.step()
-                optimizer.zero_grad()
+
+                optimizer.zero_grad(set_to_none=True)
 
             # ---------------------------------------------
             # Logging
@@ -369,8 +390,12 @@ def train():
                 accelerator.log(
                     {
                         "train/loss": current_loss,
-                        "train/main_loss": outputs.loss.detach().float().item(),
-                        "train/sub_talker_loss": sub_talker_loss.detach().float().item(),
+                        "train/main_loss": (
+                            outputs.loss.detach().float().item()
+                        ),
+                        "train/sub_talker_loss": (
+                            sub_talker_loss.detach().float().item()
+                        ),
                     },
                     step=global_step,
                 )
@@ -378,7 +403,7 @@ def train():
             global_step += 1
 
         # -----------------------------------------------------
-        # 9. Save checkpoint after each epoch
+        # 10. Save checkpoint after each epoch
         # -----------------------------------------------------
 
         accelerator.wait_for_everyone()
@@ -392,7 +417,7 @@ def train():
 
             os.makedirs(args.output_model_path, exist_ok=True)
 
-            # Copy the original model files into the checkpoint.
+            # Copy original model files
             shutil.copytree(
                 MODEL_PATH,
                 output_dir,
@@ -460,7 +485,7 @@ def train():
                 for key, value in unwrapped_model.state_dict().items()
             }
 
-            # Remove speaker encoder weights.
+            # Remove speaker encoder weights
             drop_prefix = "speaker_encoder"
 
             keys_to_drop = [
@@ -497,7 +522,10 @@ def train():
             codec_embedding_weight[3000] = (
                 target_speaker_embedding[0]
                 .detach()
-                .to(device="cpu", dtype=codec_embedding_weight.dtype)
+                .to(
+                    device="cpu",
+                    dtype=codec_embedding_weight.dtype,
+                )
             )
 
             # ---------------------------------------------
@@ -519,7 +547,7 @@ def train():
             )
 
     # ---------------------------------------------------------
-    # 10. Finish tracking
+    # 11. Finish tracking
     # ---------------------------------------------------------
 
     accelerator.wait_for_everyone()
